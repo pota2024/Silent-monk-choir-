@@ -1,0 +1,135 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function userPath() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function userDoc() { return get(userPath()); }
+    function hasUser() { return signedIn() && exists(userPath()); }
+    function isServant() { return hasUser() && userDoc().data.role == 'servant'; }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function validStage(c) { return c in ['prep', 'sec', 'uni', 'grad', 'cana']; }
+
+    // إعدادات النقاط (config/main) مع قيم افتراضية مطابقة للتطبيق
+    function cfgPath() { return /databases/$(database)/documents/config/main; }
+    function cfgv(k, d) { return exists(cfgPath()) ? get(cfgPath()).data.get(k, d) : d; }
+    function ptsAt(mins) {
+      let raw = cfgv('max', 5) - math.floor(mins / cfgv('step', 5));
+      return mins <= 0 ? cfgv('max', 5) : (raw < 0 ? 0 : raw);
+    }
+
+    // ---- كود الخدام: يُخزَّن في secrets/servant ولا يقرؤه أي عميل ----
+    match /secrets/{id} {
+      allow read, write: if false;
+    }
+    // وثيقة تُنشأ فقط لو الكود المكتوب = الكود السري. لا تُقرأ ولا تُعدَّل أبدًا.
+    match /servantSignups/{uid} {
+      allow create: if signedIn() && request.auth.uid == uid
+                    && request.resource.data.keys().hasOnly(['code'])
+                    && request.resource.data.code is string
+                    && request.resource.data.code == get(/databases/$(database)/documents/secrets/servant).data.code;
+      allow read, update, delete: if false;
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn() && (request.auth.uid == userId || isServant());
+      allow create: if signedIn() && request.auth.uid == userId && (
+        // مخدوم: لازم يرتبط بسجل مخدوم يملكه هو
+        (request.resource.data.role == 'member'
+          && request.resource.data.memberId is string
+          && exists(/databases/$(database)/documents/members/$(request.resource.data.memberId))
+          && get(/databases/$(database)/documents/members/$(request.resource.data.memberId)).data.uid == request.auth.uid)
+        // خادم: لازم يكون كتب الكود الصحيح في نفس العملية (servantSignups)
+        || (request.resource.data.role == 'servant'
+          && request.resource.data.memberId == ''
+          && request.resource.data.keys().hasOnly(['name', 'role', 'phone', 'contact', 'memberId', 'birth', 'photo', 'createdAt'])
+          && existsAfter(/databases/$(database)/documents/servantSignups/$(request.auth.uid)))
+      );
+      allow update: if signedIn() && request.auth.uid == userId
+                    && changed().hasOnly(['name', 'contact', 'phone', 'birth', 'photo']);
+      allow delete: if isServant();
+    }
+
+    match /members/{memberId} {
+      function selfCheckinUpdate() {
+        let n = request.resource.data;
+        let o = resource.data;
+        let attPath = /databases/$(database)/documents/attendance/$(n.lastCheckIn + '_' + memberId);
+        return changed().hasOnly(['points', 'attended', 'lastCheckIn'])
+               && n.lastCheckIn is string
+               && !exists(attPath) && existsAfter(attPath)
+               && getAfter(attPath).data.memberId == memberId
+               && n.points == o.points + getAfter(attPath).data.pts
+               && n.attended == o.attended + 1;
+      }
+      allow read: if signedIn();
+      allow create: if isServant() || (signedIn()
+                    && request.resource.data.uid == request.auth.uid
+                    && request.resource.data.points == 0
+                    && request.resource.data.attended == 0
+                    && validStage(request.resource.data.stage));
+      // المخدوم: بياناته الشخصية، أو نقاط حضور مرتبطة بوثيقة حضور أُنشئت في نفس العملية.
+      allow update: if isServant() || (signedIn()
+                    && resource.data.uid == request.auth.uid
+                    && (changed().hasOnly(['photo', 'phone', 'birth', 'name']) || selfCheckinUpdate()));
+      allow delete: if isServant();
+    }
+
+    match /events/{eventId} {
+      allow read: if signedIn();
+      allow create, update, delete: if isServant();
+    }
+
+    match /attendance/{attendanceId} {
+      function memberCheckin() {
+        let d = request.resource.data;
+        let u = userDoc().data;
+        let ev = get(/databases/$(database)/documents/events/$(d.eventId)).data;
+        let m = get(/databases/$(database)/documents/members/$(d.memberId)).data;
+        let mins = (request.time.toMillis() - ev.when) / 60000.0;
+        return u.role == 'member'
+          && d.keys().hasOnly(['eventId', 'memberId', 'name', 'stage', 'title', 'when', 'status', 'pts', 'at', 'manual'])
+          && d.memberId == u.memberId
+          && attendanceId == d.eventId + '_' + d.memberId
+          && d.manual == false
+          && m.uid == request.auth.uid
+          && (ev.stage == 'all' || ev.stage == m.stage)
+          && mins >= -cfgv('open', 15) && mins < cfgv('close', 60)
+          && d.name == m.name && d.stage == m.stage && d.title == ev.title && d.when == ev.when
+          && d.status in ['p', 'l']
+          && (d.pts == ptsAt(mins) || d.pts == ptsAt(mins - 1) || d.pts == ptsAt(mins + 1))
+          && math.abs(d.at - request.time.toMillis()) < 300000;
+      }
+      allow get: if signedIn() && (isServant() || resource == null
+                 || (hasUser() && resource.data.memberId == userDoc().data.memberId));
+      allow list: if signedIn() && (isServant()
+                 || (hasUser() && resource.data.memberId == userDoc().data.memberId));
+      // الخادم يسجّل يدويًا. المخدوم يسجّل حضوره بنفسه فقط ضمن نافذة الوقت وبالنقاط الصحيحة (مع سماح بفارق دقيقة للساعة).
+      // لا تعديل ولا حذف من المخدوم أبدًا.
+      allow create: if isServant() || (hasUser() && memberCheckin());
+      allow update, delete: if isServant();
+    }
+
+    match /adjustments/{adjId} {
+      allow get: if signedIn() && (isServant() || resource == null
+                 || (hasUser() && resource.data.memberId == userDoc().data.memberId));
+      allow list: if signedIn() && (isServant()
+                 || (hasUser() && resource.data.memberId == userDoc().data.memberId));
+      // إضافة/خصم النقاط وأسبابها: يكتبها الخادم فقط، ويقرؤها الخادم وصاحب النقاط.
+      allow create, update, delete: if isServant();
+    }
+
+    match /notifs/{notificationId} {
+      allow read: if signedIn() && (isServant() || (hasUser() &&
+        (resource.data.to == userDoc().data.memberId
+         || resource.data.to == 'all'
+         || (exists(/databases/$(database)/documents/members/$(userDoc().data.memberId))
+             && resource.data.to == get(/databases/$(database)/documents/members/$(userDoc().data.memberId)).data.stage))));
+      allow create, update, delete: if isServant();
+    }
+
+    match /config/{configId} {
+      allow read: if signedIn();
+      allow write: if isServant();
+    }
+  }
+}
