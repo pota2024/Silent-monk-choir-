@@ -1,0 +1,36 @@
+name: Build Android APK
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - run: npm install
+      - run: npm run build
+      - name: Guard - no old Firebase project or embedded secrets
+        run: |
+          if grep -rIl "youth-family-c039e" src www firebase.json .firebaserc capacitor.config.json 2>/dev/null | grep -v "www/app.js"; then
+            echo "Old Firebase project reference found"; exit 1
+          fi
+      - run: npx cap add android
+      - name: Permissions
+        run: sed -i 's#</manifest>#<uses-permission android:name="android.permission.CAMERA"/><uses-permission android:name="android.permission.POST_NOTIFICATIONS"/><uses-feature android:name="android.hardware.camera" android:required="false"/></manifest>#' android/app/src/main/AndroidManifest.xml
+      - name: Brand icon and splash (Silent Monk logo)
+        run: |
+          pip install --quiet pillow numpy
+          python3 scripts/make_android_icons.py
+      - run: npx cap sync android
+      - run: cd android && chmod +x gradlew && ./gradlew assembleDebug
+      - name: Name the APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk Silent-Monk-Choir.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Silent-Monk-Choir-APK
+          path: Silent-Monk-Choir.apk
